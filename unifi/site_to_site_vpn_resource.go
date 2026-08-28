@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -64,17 +65,26 @@ type siteToSiteVPNResource struct {
 // purpose="site-vpn", vpn_type="ipsec-vpn" network — the UniFi manual
 // site-to-site IPsec VPN.
 type siteToSiteVPNResourceModel struct {
-	ID             types.String         `tfsdk:"id"`
-	Site           types.String         `tfsdk:"site"`
-	Name           types.String         `tfsdk:"name"`
-	Enabled        types.Bool           `tfsdk:"enabled"`
-	Interface      types.String         `tfsdk:"interface"`
-	PeerIP         iptypes.IPv4Address  `tfsdk:"peer_ip"`
-	LocalIP        iptypes.IPv4Address  `tfsdk:"local_ip"`
-	KeyExchange    types.String         `tfsdk:"key_exchange"`
-	PreSharedKey   types.String         `tfsdk:"pre_shared_key"`
-	PreSharedKeyWO types.String         `tfsdk:"pre_shared_key_wo"`
-	RemoteSubnets  types.List           `tfsdk:"remote_subnets"`
+	ID             types.String        `tfsdk:"id"`
+	Site           types.String        `tfsdk:"site"`
+	Name           types.String        `tfsdk:"name"`
+	Enabled        types.Bool          `tfsdk:"enabled"`
+	Interface      types.String        `tfsdk:"interface"`
+	PeerIP         iptypes.IPv4Address `tfsdk:"peer_ip"`
+	LocalIP        iptypes.IPv4Address `tfsdk:"local_ip"`
+	KeyExchange    types.String        `tfsdk:"key_exchange"`
+	PreSharedKey   types.String        `tfsdk:"pre_shared_key"`
+	PreSharedKeyWO types.String        `tfsdk:"pre_shared_key_wo"`
+	RemoteSubnets  types.List          `tfsdk:"remote_subnets"`
+	// The controller stores these on every site-vpn network but upstream maps
+	// neither, and both are lost on update: ipsec_tunnel_ip is omitempty so a
+	// nil is dropped, while ipsec_tunnel_ip_enabled and
+	// remote_vpn_dynamic_subnets_enabled are plain bools with no omitempty and
+	// so are sent as false. Update() has no read-modify-write and the
+	// controller's networkconf PUT is a full replace, so a BGP tunnel silently
+	// loses the inner address it peers over.
+	TunnelIP       types.String         `tfsdk:"tunnel_ip"`
+	DynamicSubnets types.Bool           `tfsdk:"dynamic_subnets"`
 	Profile        types.String         `tfsdk:"profile"`
 	IKEEncryption  types.String         `tfsdk:"ike_encryption"`
 	IKEHash        types.String         `tfsdk:"ike_hash"`
@@ -222,13 +232,31 @@ func (r *siteToSiteVPNResource) Schema(
 				},
 			},
 			"remote_subnets": schema.ListAttribute{
-				MarkdownDescription: "The remote site's subnets reachable through the tunnel (CIDR).",
-				ElementType:         types.StringType,
-				Required:            true,
+				MarkdownDescription: "The remote site's subnets reachable through the tunnel (CIDR). " +
+					"May be empty when `dynamic_subnets` is true, which is how a BGP tunnel " +
+					"expresses that the remote prefixes are learned rather than configured.",
+				ElementType: types.StringType,
+				Optional:    true,
+				Computed:    true,
 				Validators: []validator.List{
-					listvalidator.SizeAtLeast(1),
 					listvalidator.ValueStringsAre(validators.CIDRValidator()),
 				},
+				PlanModifiers: []planmodifier.List{listplanmodifier.UseStateForUnknown()},
+			},
+			"tunnel_ip": schema.StringAttribute{
+				MarkdownDescription: "Inner address of the tunnel interface, as a CIDR " +
+					"(e.g. `169.254.21.2/30`). This is the address a dynamic-routing tunnel " +
+					"peers over; setting it also sets `ipsec_tunnel_ip_enabled`.",
+				Optional:      true,
+				Computed:      true,
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"dynamic_subnets": schema.BoolAttribute{
+				MarkdownDescription: "Accept remote subnets learned dynamically (over BGP) rather " +
+					"than from `remote_subnets`.",
+				Optional:      true,
+				Computed:      true,
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 			"profile": schema.StringAttribute{
 				MarkdownDescription: "IPsec profile. One of `customized`, `azure_dynamic`, or " +
@@ -658,6 +686,18 @@ func (r *siteToSiteVPNResource) modelToNetwork(
 		diags.Append(model.RemoteSubnets.ElementsAs(ctx, &network.RemoteVPNSubnets, false)...)
 	}
 
+	// ipsec_tunnel_ip is `omitempty`, and ipsec_tunnel_ip_enabled is a plain
+	// bool without it — so leaving these unset on an update PUT silently strips
+	// the inner address and disables the flag. Update() has no read-modify-write
+	// and the controller's networkconf PUT is a full replace, so both must be
+	// derived here or a tunnel that peers over the inner address loses it.
+	network.IPSecTunnelIP = optStr(model.TunnelIP)
+	network.IPSecTunnelIPEnabled = network.IPSecTunnelIP != nil
+
+	// Same hazard: a plain bool with no omitempty, so an unmapped value is sent
+	// as false and dynamic remote subnets are turned off behind the operator.
+	network.RemoteVPNDynamicSubnetsEnabled = model.DynamicSubnets.ValueBool()
+
 	return network, diags
 }
 
@@ -699,6 +739,9 @@ func (r *siteToSiteVPNResource) networkToModel(
 	subnets, subnetDiags := types.ListValueFrom(ctx, types.StringType, network.RemoteVPNSubnets)
 	diags.Append(subnetDiags...)
 	model.RemoteSubnets = subnets
+
+	model.TunnelIP = stringPtrOrNull(network.IPSecTunnelIP)
+	model.DynamicSubnets = types.BoolValue(network.RemoteVPNDynamicSubnetsEnabled)
 
 	return diags
 }
